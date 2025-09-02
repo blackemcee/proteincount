@@ -452,6 +452,91 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=MAIN_KEYBOARD
     )
 
+async def update_by_id(user_id: int, entry_id: int, item: str, protein_g: float, calories_kcal: float) -> Optional[Entry]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE entries
+            SET item = $3, protein_g = $4, calories_kcal = $5
+            WHERE id = $1 AND user_id = $2
+            RETURNING id, user_id, ts_utc, date_local, tz_offset, item, protein_g, calories_kcal
+            """,
+            entry_id, user_id, item, protein_g, calories_kcal
+        )
+        if not row:
+            return None
+        return Entry(
+            id=row["id"], user_id=row["user_id"], ts_utc=row["ts_utc"], date_local=row["date_local"],
+            tz_offset=row["tz_offset"], item=row["item"],
+            protein_g=float(row["protein_g"]), calories_kcal=float(row["calories_kcal"])
+        )
+
+async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text or ""
+    parts = text.split(maxsplit=2)
+    if len(parts) < 3:
+        await update.message.reply_text(
+            "Формат: /edit <id> <название белок ккал>\n"
+            "Примеры:\n"
+            "/edit 12 омлет 30 250\n"
+            "/edit 12 омлет; 30; 250",
+            reply_markup=MAIN_KEYBOARD
+        )
+        return
+
+    # id
+    try:
+        entry_id = int(parts[1])
+    except ValueError:
+        await update.message.reply_text("id должен быть числом: /edit 12 омлет 30 250", reply_markup=MAIN_KEYBOARD)
+        return
+
+    # новые данные
+    payload = parts[2]
+    parsed = parse_freeform(payload)
+    if not parsed:
+        await update.message.reply_text(
+            "Не понял новые данные. Примеры: «омлет 30 250» или «омлет; 30; 250»",
+            reply_markup=MAIN_KEYBOARD
+        )
+        return
+    item, protein, calories = parsed
+
+    uid = update.effective_user.id
+    updated = await update_by_id(uid, entry_id, item, protein, calories)
+    if not updated:
+        await update.message.reply_text("Запись не найдена или не твоя.", reply_markup=MAIN_KEYBOARD)
+        return
+
+    # Покажем новые итоги за дату этой записи (с учётом целей на ту дату)
+    tzinfo = user_tz(update)
+    p, c = await totals_for_date(uid, updated.date_local)
+    goal_p = get_goal_protein_for_user(await get_weight_for_date(uid, updated.date_local, tzinfo))
+    cal_lim = await get_cal_limit_for_date(uid, updated.date_local, tzinfo)
+    remain_p = max(goal_p - p, 0.0)
+    remain_c = max(cal_lim - c, 0.0)
+
+    await update.message.reply_text(
+        "Обновлено (#{id}): {item} — {p1}, {c1}\n"
+        "Итого за {date}: {p2}, {c2}\n"
+        "Цель белка: {gp}, осталось: {rp}\n"
+        "Лимит калорий: {gl}, осталось: {rl}".format(
+            id=updated.id,
+            item=updated.item,
+            p1=fmt_amount(updated.protein_g, "г белка"),
+            c1=fmt_amount(updated.calories_kcal, "ккал"),
+            date=updated.date_local.isoformat(),
+            p2=fmt_amount(p, "г белка"),
+            c2=fmt_amount(c, "ккал"),
+            gp=fmt_amount(goal_p, "г"),
+            rp=fmt_amount(remain_p, "г"),
+            gl=fmt_amount(cal_lim, "ккал"),
+            rl=fmt_amount(remain_c, "ккал"),
+        ),
+        reply_markup=MAIN_KEYBOARD
+    )
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
 
@@ -665,6 +750,7 @@ def main():
     app.add_handler(CommandHandler("weight", cmd_weight))
     app.add_handler(CommandHandler("calories", cmd_calories))   # <— НОВОЕ
     app.add_handler(CommandHandler("add", cmd_add))
+    app.add_handler(CommandHandler("edit", cmd_edit))
     app.add_handler(CommandHandler(["today"], cmd_today))
     app.add_handler(CommandHandler(["sum"], cmd_sum))
     app.add_handler(CommandHandler(["undo"], cmd_undo))
