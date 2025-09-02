@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
 """
 Protein & Calories Tracker Bot — PostgreSQL (Railway)
+----------------------------------------------------
 Зависимости: python-telegram-bot==21.4, asyncpg==0.29.0, python-dateutil, certifi
 
-ENV:
-  TELEGRAM_TOKEN=...
-  DATABASE_URL=...  # PUBLIC URL из Postgres (или DATABASE_PUBLIC_URL) + ?sslmode=require
-  USER_TZ=Europe/Amsterdam      # опц.
-  ALLOW_SELF_SIGNED=1           # опц. (временный небезопасный режим SSL)
+ENV (Railway → Variables):
+  TELEGRAM_TOKEN=...                        # токен бота из BotFather
+  DATABASE_URL=...                          # PUBLIC URL из Postgres (или DATABASE_PUBLIC_URL) + ?sslmode=require
+  USER_TZ=Europe/Amsterdam                  # (опционально)
+  ALLOW_SELF_SIGNED=1                       # (опционально, временно) ослабленный SSL, если strict падает
 """
 from __future__ import annotations
 
-import csv, io, logging, os, re, ssl, sys
+import csv
+import io
+import logging
+import os
+import re
+import ssl
+import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date as Date
 from typing import List, Optional, Tuple
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
-import asyncpg, certifi
+import asyncpg
+import certifi
 from dateutil import tz
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 from telegram.ext import (
@@ -25,6 +33,7 @@ from telegram.ext import (
     ContextTypes, filters
 )
 
+# ---- логирование ----
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 log = logging.getLogger("bot")
 
@@ -51,16 +60,20 @@ class Entry:
     id: int
     user_id: int
     ts_utc: datetime
-    date_local: datetime
+    date_local: Date
     tz_offset: str
     item: str
     protein_g: float
     calories_kcal: float
 
-# ---------------- DB pool ----------------
+
+# ===================== DB POOL =====================
+
 def _mask_dsn(dsn: str) -> str:
+    """Скрыть пароль в DSN для логов."""
     try:
-        u = urlparse(dsn); netloc = u.netloc
+        u = urlparse(dsn)
+        netloc = u.netloc
         if "@" in netloc:
             creds, host = netloc.split("@", 1)
             if ":" in creds:
@@ -71,20 +84,30 @@ def _mask_dsn(dsn: str) -> str:
         return "<hidden>"
 
 def _ensure_sslmode_require(dsn: str) -> str:
-    u = urlparse(dsn); q = dict(parse_qsl(u.query, keep_blank_values=True))
+    u = urlparse(dsn)
+    q = dict(parse_qsl(u.query, keep_blank_values=True))
     q.setdefault("sslmode", "require")
     return urlunparse((u.scheme, u.netloc, u.path, u.params, urlencode(q), u.fragment))
 
 async def get_pool() -> asyncpg.Pool:
+    """
+    Создаёт (один раз) пул соединений с PostgreSQL.
+    - Берём DSN из DATABASE_URL (или DATABASE_PUBLIC_URL).
+    - Если не *.railway.internal → публичный хост: строгий SSL (certifi) и sslmode=require.
+    - Если *.railway.internal → внутренний хост: без SSL (нужна Private Networking).
+    - Если строгий SSL падает и ALLOW_SELF_SIGNED=1 → пробуем RELAXED SSL (временно, небезопасно).
+    """
     global POOL
     if POOL is not None:
         return POOL
+
     if not DATABASE_URL:
         raise SystemExit("DATABASE_URL (или DATABASE_PUBLIC_URL) must be set")
 
     dsn = DATABASE_URL.strip()
     is_internal = ".railway.internal" in dsn
     use_ssl = not is_internal
+
     if use_ssl:
         dsn = _ensure_sslmode_require(dsn)
 
@@ -96,12 +119,15 @@ async def get_pool() -> asyncpg.Pool:
 
     log.info("[DB] DSN: %s", _mask_dsn(dsn))
     log.info("[DB] Host type: %s", "external (SSL strict)" if use_ssl else "internal (no SSL)")
+
     try:
         POOL = await asyncpg.create_pool(dsn, min_size=1, max_size=4, ssl=strict_ssl)
     except Exception as e:
-        log.error("[DB] Strict connection failed: %r", e)
+        msg = repr(e)
+        log.error("[DB] Strict connection failed: %s", msg)
+
         allow_relax = os.environ.get("ALLOW_SELF_SIGNED") == "1"
-        if use_ssl and allow_relax and "CERTIFICATE_VERIFY_FAILED" in repr(e):
+        if use_ssl and allow_relax and "CERTIFICATE_VERIFY_FAILED" in msg:
             log.warning("[DB] Retrying with RELAXED SSL (NOT secure, temporary)…")
             relaxed_ssl = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             relaxed_ssl.check_hostname = False
@@ -116,43 +142,55 @@ async def get_pool() -> asyncpg.Pool:
 
     async with POOL.acquire() as conn:
         await conn.execute(CREATE_SQL)
+
     log.info("[DB] Pool ready.")
     return POOL
 
-# --------------- DB queries ---------------
-async def add_entry(user_id: int, date_local: str, tz_offset: str,
+
+# ===================== DB QUERIES =====================
+
+async def add_entry(user_id: int, date_local: Date, tz_offset: str,
                     item: str, protein_g: float, calories_kcal: float) -> int:
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            """INSERT INTO entries (user_id, ts_utc, date_local, tz_offset, item, protein_g, calories_kcal)
-               VALUES ($1, NOW() AT TIME ZONE 'UTC', $2::date, $3, $4, $5, $6) RETURNING id""",
+            """
+            INSERT INTO entries (user_id, ts_utc, date_local, tz_offset, item, protein_g, calories_kcal)
+            VALUES ($1, NOW() AT TIME ZONE 'UTC', $2, $3, $4, $5, $6)
+            RETURNING id
+            """,
             user_id, date_local, tz_offset, item, protein_g, calories_kcal,
         )
         return int(row["id"])
 
-async def get_entries(user_id: int, date_local: str) -> List[Entry]:
+async def get_entries(user_id: int, date_local: Date) -> List[Entry]:
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            """SELECT id, user_id, ts_utc, date_local, tz_offset, item, protein_g, calories_kcal
-               FROM entries WHERE user_id=$1 AND date_local=$2::date ORDER BY id ASC""",
+            """
+            SELECT id, user_id, ts_utc, date_local, tz_offset, item, protein_g, calories_kcal
+            FROM entries WHERE user_id=$1 AND date_local=$2 ORDER BY id ASC
+            """,
             user_id, date_local,
         )
-        return [Entry(
-            id=r["id"], user_id=r["user_id"], ts_utc=r["ts_utc"], date_local=r["date_local"],
-            tz_offset=r["tz_offset"], item=r["item"],
-            protein_g=float(r["protein_g"]), calories_kcal=float(r["calories_kcal"])
-        ) for r in rows]
+        return [
+            Entry(
+                id=r["id"], user_id=r["user_id"], ts_utc=r["ts_utc"], date_local=r["date_local"],
+                tz_offset=r["tz_offset"], item=r["item"],
+                protein_g=float(r["protein_g"]), calories_kcal=float(r["calories_kcal"])
+            ) for r in rows
+        ]
 
-async def delete_last_today(user_id: int, date_local: str) -> Optional[Entry]:
+async def delete_last_today(user_id: int, date_local: Date) -> Optional[Entry]:
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            """DELETE FROM entries WHERE id IN (
-                   SELECT id FROM entries WHERE user_id=$1 AND date_local=$2::date ORDER BY id DESC LIMIT 1
-               )
-               RETURNING id, user_id, ts_utc, date_local, tz_offset, item, protein_g, calories_kcal""",
+            """
+            DELETE FROM entries WHERE id IN (
+              SELECT id FROM entries WHERE user_id=$1 AND date_local=$2 ORDER BY id DESC LIMIT 1
+            )
+            RETURNING id, user_id, ts_utc, date_local, tz_offset, item, protein_g, calories_kcal
+            """,
             user_id, date_local,
         )
         if not row:
@@ -163,18 +201,24 @@ async def delete_last_today(user_id: int, date_local: str) -> Optional[Entry]:
             protein_g=float(row["protein_g"]), calories_kcal=float(row["calories_kcal"])
         )
 
-async def totals_for_date(user_id: int, date_local: str) -> Tuple[float, float]:
+async def totals_for_date(user_id: int, date_local: Date) -> Tuple[float, float]:
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            """SELECT COALESCE(SUM(protein_g),0) AS sum_protein,
-                      COALESCE(SUM(calories_kcal),0) AS sum_cal
-               FROM entries WHERE user_id=$1 AND date_local=$2::date""",
+            """
+            SELECT
+              COALESCE(SUM(protein_g), 0) AS sum_protein,
+              COALESCE(SUM(calories_kcal), 0) AS sum_cal
+            FROM entries
+            WHERE user_id=$1 AND date_local=$2
+            """,
             user_id, date_local,
         )
         return float(row["sum_protein"]), float(row["sum_cal"])
 
-# ---------------- helpers ----------------
+
+# ===================== HELPERS =====================
+
 PROTEIN_RE = r"(?:(?:белка?|протеин|protein|prot)\s*[:=]?\s*|\b)(-?\d+[\.,]?\d*)\s*(?:г|g|гр|grams?)?\b"
 CALORIES_RE = r"(?:(?:ккал|кило?кал|calories?|k?kcals?|k?cal)\s*[:=]?\s*|\b)(-?\d+[\.,]?\d*)\b"
 
@@ -182,14 +226,18 @@ def clean_number(s: str) -> float:
     return float(str(s).replace(",", "."))
 
 def parse_freeform(text: str) -> Optional[Tuple[str, float, float]]:
+    # Формат A: "название; белок; ккал"
     if ";" in text:
         parts = [p.strip() for p in text.split(";")]
         if len(parts) >= 3:
             item = parts[0]
             try:
-                return item, clean_number(parts[1]), clean_number(parts[2])
+                protein = clean_number(parts[1])
+                calories = clean_number(parts[2])
+                return item, protein, calories
             except ValueError:
                 pass
+    # Формат B: свободный текст "йогурт 20г белка 120 ккал"
     prot_match = re.search(PROTEIN_RE, text, flags=re.I)
     cal_match = re.search(CALORIES_RE, text, flags=re.I)
     if prot_match and cal_match:
@@ -199,9 +247,13 @@ def parse_freeform(text: str) -> Optional[Tuple[str, float, float]]:
         tmp = re.sub(CALORIES_RE, "", tmp, flags=re.I)
         item = re.sub(r"\s+", " ", tmp).strip(" -:.,\n") or "без названия"
         return item, protein, calories
+    # Формат C: "стейк 60 450"
     m = re.search(r"^/?(?:add\s+)?(.+?)\s+(-?\d+[\.,]?\d*)\s+(-?\d+[\.,]?\d*)$", text.strip(), flags=re.I)
     if m:
-        return m.group(1).strip(), clean_number(m.group(2)), clean_number(m.group(3))
+        item = m.group(1).strip()
+        protein = clean_number(m.group(2))
+        calories = clean_number(m.group(3))
+        return item, protein, calories
     return None
 
 def fmt_amount(x: float, unit: str) -> str:
@@ -211,8 +263,16 @@ def user_tz(update: Update):
     tz_name = os.environ.get("USER_TZ")
     return (tz.gettz(tz_name) if tz_name else tz.tzlocal()) or timezone.utc
 
-def today_local_str(tzinfo) -> str:
-    return datetime.now(tzinfo).strftime("%Y-%m-%d")
+def today_local_date(tzinfo) -> Date:
+    return datetime.now(tzinfo).date()
+
+def parse_date_arg(args, tzinfo) -> Date:
+    if not args:
+        return today_local_date(tzinfo)
+    try:
+        return datetime.strptime(args[0], "%Y-%m-%d").date()
+    except Exception:
+        return today_local_date(tzinfo)
 
 def tz_offset_str(tzinfo) -> str:
     off = datetime.now(tzinfo).utcoffset() or timedelta(0)
@@ -220,7 +280,9 @@ def tz_offset_str(tzinfo) -> str:
     total = abs(total); h, r = divmod(total, 3600); m, _ = divmod(r, 60)
     return f"{sign}{h:02d}:{m:02d}"
 
-# ---------------- handlers ----------------
+
+# ===================== HANDLERS =====================
+
 WELCOME = (
     "Привет! Я считаю белок и калории (PostgreSQL).\n\n"
     "Добавляй записи так:\n"
@@ -237,7 +299,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(WELCOME)
 
 async def handle_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    parsed = parse_freeform(update.message.text if update.message else "")
+    text = update.message.text if update.message else ""
+    parsed = parse_freeform(text)
     if not parsed:
         await update.message.reply_text(
             "Не понял формат. Примеры:\n"
@@ -246,9 +309,13 @@ async def handle_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     item, protein, calories = parsed
-    tzinfo = user_tz(update); date_str = today_local_str(tzinfo); off = tz_offset_str(tzinfo)
-    rid = await add_entry(update.effective_user.id, date_str, off, item, protein, calories)
-    await update.message.reply_text(f"Добавлено: {item} — {fmt_amount(protein, 'г белка')}, {fmt_amount(calories, 'ккал')} (#{rid})")
+    tzinfo = user_tz(update)
+    date_obj = today_local_date(tzinfo)
+    off = tz_offset_str(tzinfo)
+    rid = await add_entry(update.effective_user.id, date_obj, off, item, protein, calories)
+    await update.message.reply_text(
+        f"Добавлено: {item} — {fmt_amount(protein, 'г белка')}, {fmt_amount(calories, 'ккал')} (#{rid})"
+    )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parsed = parse_freeform(update.message.text)
@@ -258,17 +325,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await handle_add(update, context)
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tzinfo = user_tz(update); date_str = today_local_str(tzinfo)
-    await send_summary(update, context, date_str)
+    tzinfo = user_tz(update)
+    date_obj = today_local_date(tzinfo)
+    await send_summary(update, context, date_obj)
 
 async def cmd_sum(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tzinfo = user_tz(update); date_str = today_local_str(tzinfo) if not context.args else context.args[0]
-    await send_summary(update, context, date_str)
+    tzinfo = user_tz(update)
+    date_obj = parse_date_arg(context.args, tzinfo)
+    await send_summary(update, context, date_obj)
 
-async def send_summary(update: Update, context: ContextTypes.DEFAULT_TYPE, date_str: str):
+async def send_summary(update: Update, context: ContextTypes.DEFAULT_TYPE, date_obj: Date):
     uid = update.effective_user.id
-    p, c = await totals_for_date(uid, date_str)
-    entries = await get_entries(uid, date_str)
+    p, c = await totals_for_date(uid, date_obj)
+    entries = await get_entries(uid, date_obj)
+    date_str = date_obj.isoformat()
     header = f"Итого за {date_str}: {fmt_amount(p, 'г белка')}, {fmt_amount(c, 'ккал')}\n"
     if not entries:
         await update.message.reply_text(header + "\nЗаписей нет. Добавь что-нибудь через /add.")
@@ -280,48 +350,64 @@ async def send_summary(update: Update, context: ContextTypes.DEFAULT_TYPE, date_
     await update.message.reply_text("\n".join(lines), reply_markup=kb)
 
 async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tzinfo = user_tz(update); date_str = today_local_str(tzinfo)
-    entry = await delete_last_today(update.effective_user.id, date_str)
+    tzinfo = user_tz(update)
+    date_obj = today_local_date(tzinfo)
+    entry = await delete_last_today(update.effective_user.id, date_obj)
     if not entry:
         await update.message.reply_text("За сегодня записей нет — удалять нечего.")
         return
-    await update.message.reply_text(f"Удалено: {entry.item} — {fmt_amount(entry.protein_g, 'г')}, {fmt_amount(entry.calories_kcal, 'ккал')} (#{entry.id})")
+    await update.message.reply_text(
+        f"Удалено: {entry.item} — {fmt_amount(entry.protein_g, 'г')}, {fmt_amount(entry.calories_kcal, 'ккал')} (#{entry.id})"
+    )
 
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tzinfo = user_tz(update); date_str = today_local_str(tzinfo) if not context.args else context.args[0]
-    await do_export(update, context, date_str)
+    tzinfo = user_tz(update)
+    date_obj = parse_date_arg(context.args, tzinfo)
+    await do_export(update, context, date_obj)
 
 async def on_export_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
     if not q.data or not q.data.startswith("export:"):
         return
     date_str = q.data.split(":", 1)[1]
-    await do_export(update, context, date_str)
+    try:
+        date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except Exception:
+        date_obj = today_local_date(tz.tzlocal() or timezone.utc)
+    await do_export(update, context, date_obj)
 
-async def do_export(update: Update, context: ContextTypes.DEFAULT_TYPE, date_str: str):
+async def do_export(update: Update, context: ContextTypes.DEFAULT_TYPE, date_obj: Date):
     uid = update.effective_user.id
-    entries = await get_entries(uid, date_str)
+    entries = await get_entries(uid, date_obj)
     if not entries:
-        if update.message: await update.message.reply_text("Нет записей для экспорта.")
-        else: await update.callback_query.edit_message_text("Нет записей для экспорта.")
+        if update.message:
+            await update.message.reply_text("Нет записей для экспорта.")
+        else:
+            await update.callback_query.edit_message_text("Нет записей для экспорта.")
         return
-    buf = io.StringIO(); w = csv.writer(buf)
+    buf = io.StringIO()
+    w = csv.writer(buf)
     w.writerow(["id", "date", "time_utc", "item", "protein_g", "calories_kcal"])
     for e in entries:
-        w.writerow([e.id, e.date_local, e.ts_utc.isoformat(), e.item, e.protein_g, e.calories_kcal])
-    data = buf.getvalue().encode("utf-8"); fname = f"nutrition_{date_str}.csv"
-    await update.effective_message.reply_document(document=InputFile(io.BytesIO(data), filename=fname),
-                                                  caption=f"Экспорт за {date_str}")
+        w.writerow([e.id, e.date_local.isoformat(), e.ts_utc.isoformat(), e.item, e.protein_g, e.calories_kcal])
+    data = buf.getvalue().encode("utf-8")
+    fname = f"nutrition_{date_obj.isoformat()}.csv"
+    await update.effective_message.reply_document(
+        document=InputFile(io.BytesIO(data), filename=fname),
+        caption=f"Экспорт за {date_obj.isoformat()}"
+    )
 
-# ---------------- PTB error hook & post_init ----------------
+
+# ===================== PTB hooks & MAIN =====================
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.error("Handler error: %r", context.error)
 
 async def post_init(app: Application):
-    # инициализация БД внутри event loop PTB — без asyncio.run и прочих танцев
+    # Инициализация пула/схемы внутри event loop PTB
     await get_pool()
 
-# ---------------- main ----------------
 def main():
     if not TOKEN:
         raise SystemExit("TELEGRAM_TOKEN env var is required")
@@ -343,7 +429,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     log.info("Bot starting (PostgreSQL)…")
-    app.run_polling()  # синхронно; PTB сам управляет event loop
+    app.run_polling()  # синхронный запуск; PTB сам управляет event loop
 
 if __name__ == "__main__":
     main()
