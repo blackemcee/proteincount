@@ -53,7 +53,19 @@ CREATE TABLE IF NOT EXISTS entries (
   calories_kcal DOUBLE PRECISION NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_entries_user_date ON entries(user_id, date_local);
+
+-- Храним историю веса; берём последнее значение как актуальное
+CREATE TABLE IF NOT EXISTS user_weights (
+  id SERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL,
+  ts_utc TIMESTAMPTZ NOT NULL DEFAULT NOW() AT TIME ZONE 'UTC',
+  weight_kg DOUBLE PRECISION NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_user_weights_user_ts ON user_weights(user_id, ts_utc DESC);
 """
+
+DEFAULT_WEIGHT_KG = 80.0  # если пользователь ни разу не задавал вес
+PROTEIN_PER_KG = 2.0      # 2 г белка на кг
 
 @dataclass
 class Entry:
@@ -201,6 +213,25 @@ async def delete_last_today(user_id: int, date_local: Date) -> Optional[Entry]:
             protein_g=float(row["protein_g"]), calories_kcal=float(row["calories_kcal"])
         )
 
+async def delete_by_id(user_id: int, entry_id: int) -> Optional[Entry]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            DELETE FROM entries
+            WHERE id = $1 AND user_id = $2
+            RETURNING id, user_id, ts_utc, date_local, tz_offset, item, protein_g, calories_kcal
+            """,
+            entry_id, user_id
+        )
+        if not row:
+            return None
+        return Entry(
+            id=row["id"], user_id=row["user_id"], ts_utc=row["ts_utc"], date_local=row["date_local"],
+            tz_offset=row["tz_offset"], item=row["item"],
+            protein_g=float(row["protein_g"]), calories_kcal=float(row["calories_kcal"])
+        )
+
 async def totals_for_date(user_id: int, date_local: Date) -> Tuple[float, float]:
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -215,6 +246,26 @@ async def totals_for_date(user_id: int, date_local: Date) -> Tuple[float, float]
             user_id, date_local,
         )
         return float(row["sum_protein"]), float(row["sum_cal"])
+
+# ---- вес пользователя ----
+async def set_weight(user_id: int, weight_kg: float) -> None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO user_weights (user_id, weight_kg) VALUES ($1, $2)",
+            user_id, weight_kg
+        )
+
+async def get_latest_weight(user_id: int) -> Optional[float]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT weight_kg FROM user_weights WHERE user_id=$1 ORDER BY ts_utc DESC LIMIT 1",
+            user_id
+        )
+        if not row:
+            return None
+        return float(row["weight_kg"])
 
 
 # ===================== HELPERS =====================
@@ -238,7 +289,7 @@ def parse_freeform(text: str) -> Optional[Tuple[str, float, float]]:
             except ValueError:
                 pass
 
-    # ⚠️ Формат C (подняли выше): "/add омлет 45 400" или "стейк 60 450"
+    # Формат C (поднят выше): "/add омлет 45 400" или "стейк 60 450"
     m = re.search(r"^\s*/?(?:add\s+)?(.+?)\s+(-?\d+[\.,]?\d*)\s+(-?\d+[\.,]?\d*)\s*$",
                   text.strip(), flags=re.I)
     if m:
@@ -284,6 +335,10 @@ def tz_offset_str(tzinfo) -> str:
     total = abs(total); h, r = divmod(total, 3600); m, _ = divmod(r, 60)
     return f"{sign}{h:02d}:{m:02d}"
 
+def get_goal_protein_for_user(weight_kg: Optional[float]) -> float:
+    w = weight_kg if weight_kg is not None else DEFAULT_WEIGHT_KG
+    return w * PROTEIN_PER_KG
+
 
 # ===================== HANDLERS =====================
 
@@ -291,9 +346,12 @@ WELCOME = (
     "Привет! Я считаю белок и калории (PostgreSQL).\n\n"
     "Добавляй записи так:\n"
     "1) /add куриная грудка; 45; 220\n"
-    "2) Просто сообщением: \"йогурт 20г белка 120 ккал\"\n"
-    "3) \"стейк 60 450\" (белок г, ккал)\n\n"
-    "Команды: /today, /sum [YYYY-MM-DD], /undo, /export [YYYY-MM-DD], /help"
+    "2) \"/add омлет 45 400\"\n"
+    "3) просто текст: \"йогурт 20г белка 120 ккал\"\n\n"
+    "Вес и цель по белку:\n"
+    "• /weight 82 — установить вес (цель = 2 г/кг)\n"
+    "Если вес не задан, беру 80 кг.\n\n"
+    "Команды: /today, /sum [YYYY-MM-DD], /undo, /delete <id>, /export [YYYY-MM-DD], /help"
 )
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -309,7 +367,7 @@ async def handle_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Не понял формат. Примеры:\n"
             "/add омлет; 24; 300\n"
-            "или: \"/add омлет 24 300\"\n"
+            "/add омлет 24 300\n"
             "или: \"творог 28 белка 160 ккал\""
         )
         return
@@ -320,12 +378,17 @@ async def handle_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     off = tz_offset_str(tzinfo)
 
     rid = await add_entry(update.effective_user.id, date_obj, off, item, protein, calories)
-    # Считаем итог за день сразу после добавления
+    # Сразу показываем итоги за день + цель
     total_p, total_c = await totals_for_date(update.effective_user.id, date_obj)
+    weight = await get_latest_weight(update.effective_user.id)
+    goal = get_goal_protein_for_user(weight)
+    remain = max(goal - total_p, 0.0)
 
     await update.message.reply_text(
         "Добавлено: {item} — {p}, {c} (#{rid})\n"
-        "Итого за {date}: {tp}, {tc}".format(
+        "Итого за {date}: {tp}, {tc}\n"
+        "Цель по белку: {goal}\n"
+        "Осталось: {remain}".format(
             item=item,
             p=fmt_amount(protein, "г белка"),
             c=fmt_amount(calories, "ккал"),
@@ -333,6 +396,8 @@ async def handle_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
             date=date_obj.isoformat(),
             tp=fmt_amount(total_p, "г белка"),
             tc=fmt_amount(total_c, "ккал"),
+            goal=fmt_amount(goal, "г"),
+            remain=fmt_amount(remain, "г"),
         )
     )
 
@@ -357,12 +422,20 @@ async def send_summary(update: Update, context: ContextTypes.DEFAULT_TYPE, date_
     uid = update.effective_user.id
     p, c = await totals_for_date(uid, date_obj)
     entries = await get_entries(uid, date_obj)
+    weight = await get_latest_weight(uid)
+    goal = get_goal_protein_for_user(weight)
+    remain = max(goal - p, 0.0)
+
     date_str = date_obj.isoformat()
-    header = f"Итого за {date_str}: {fmt_amount(p, 'г белка')}, {fmt_amount(c, 'ккал')}\n"
+    header = (
+        f"Итого за {date_str}: {fmt_amount(p, 'г белка')}, {fmt_amount(c, 'ккал')}\n"
+        f"Цель по белку: {fmt_amount(goal, 'г')} (2 г/кг)\n"
+        f"Осталось: {fmt_amount(remain, 'г')}\n"
+    )
     if not entries:
         await update.message.reply_text(header + "\nЗаписей нет. Добавь что-нибудь через /add.")
         return
-    lines = [header, "\nЗаписи:"]
+    lines = [header, "Записи:"]
     for e in entries:
         lines.append(f"• {e.item} — {fmt_amount(e.protein_g, 'г')}, {fmt_amount(e.calories_kcal, 'ккал')} (#{e.id})")
     kb = InlineKeyboardMarkup([[InlineKeyboardButton(text="Экспорт CSV", callback_data=f"export:{date_str}")]])
@@ -375,8 +448,65 @@ async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not entry:
         await update.message.reply_text("За сегодня записей нет — удалять нечего.")
         return
+    # Покажем отмену + новые итоги/цель
+    p, c = await totals_for_date(update.effective_user.id, date_obj)
+    weight = await get_latest_weight(update.effective_user.id)
+    goal = get_goal_protein_for_user(weight)
+    remain = max(goal - p, 0.0)
+
     await update.message.reply_text(
-        f"Удалено: {entry.item} — {fmt_amount(entry.protein_g, 'г')}, {fmt_amount(entry.calories_kcal, 'ккал')} (#{entry.id})"
+        "Удалено: {item} — {p1}, {c1} (#{id})\n"
+        "Итого за {date}: {p2}, {c2}\n"
+        "Цель по белку: {goal}\n"
+        "Осталось: {remain}".format(
+            item=entry.item,
+            p1=fmt_amount(entry.protein_g, "г"),
+            c1=fmt_amount(entry.calories_kcal, "ккал"),
+            id=entry.id,
+            date=date_obj.isoformat(),
+            p2=fmt_amount(p, "г белка"),
+            c2=fmt_amount(c, "ккал"),
+            goal=fmt_amount(goal, "г"),
+            remain=fmt_amount(remain, "г"),
+        )
+    )
+
+async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Укажи id записи: /delete 12")
+        return
+    try:
+        entry_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("id должен быть числом: /delete 12")
+        return
+
+    uid = update.effective_user.id
+    deleted = await delete_by_id(uid, entry_id)
+    if not deleted:
+        await update.message.reply_text("Запись не найдена или не твоя.")
+        return
+
+    p, c = await totals_for_date(uid, deleted.date_local)
+    weight = await get_latest_weight(uid)
+    goal = get_goal_protein_for_user(weight)
+    remain = max(goal - p, 0.0)
+
+    await update.message.reply_text(
+        "Удалено: {item} — {p1}, {c1} (#{id})\n"
+        "Итого за {date}: {p2}, {c2}\n"
+        "Цель по белку: {goal}\n"
+        "Осталось: {remain}".format(
+            item=deleted.item,
+            p1=fmt_amount(deleted.protein_g, "г"),
+            c1=fmt_amount(deleted.calories_kcal, "ккал"),
+            id=deleted.id,
+            date=deleted.date_local.isoformat(),
+            p2=fmt_amount(p, "г белка"),
+            c2=fmt_amount(c, "ккал"),
+            goal=fmt_amount(goal, "г"),
+            remain=fmt_amount(remain, "г"),
+        )
     )
 
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -417,6 +547,30 @@ async def do_export(update: Update, context: ContextTypes.DEFAULT_TYPE, date_obj
         caption=f"Экспорт за {date_obj.isoformat()}"
     )
 
+# ---- вес: команды ----
+async def cmd_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        current = await get_latest_weight(update.effective_user.id)
+        current = current if current is not None else DEFAULT_WEIGHT_KG
+        await update.message.reply_text(
+            f"Текущий вес: {fmt_amount(current, 'кг')}\n"
+            f"Цель по белку: {fmt_amount(get_goal_protein_for_user(current), 'г')} (2 г/кг)\n"
+            f"Чтобы задать новый: /weight 82"
+        )
+        return
+    try:
+        w = float(str(context.args[0]).replace(",", "."))
+        if w <= 0 or w > 500:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Укажи корректный вес в килограммах, например: /weight 82")
+        return
+    await set_weight(update.effective_user.id, w)
+    await update.message.reply_text(
+        f"Вес обновлён: {fmt_amount(w, 'кг')}. "
+        f"Новая цель по белку: {fmt_amount(get_goal_protein_for_user(w), 'г')} в день."
+    )
+
 
 # ===================== PTB hooks & MAIN =====================
 
@@ -439,10 +593,12 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("weight", cmd_weight))    # <— НОВОЕ
     app.add_handler(CommandHandler("add", handle_add))
     app.add_handler(CommandHandler(["today"], cmd_today))
     app.add_handler(CommandHandler(["sum"], cmd_sum))
     app.add_handler(CommandHandler(["undo"], cmd_undo))
+    app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(CommandHandler(["export"], cmd_export))
     app.add_handler(CallbackQueryHandler(on_export_cb, pattern=r"^export:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
