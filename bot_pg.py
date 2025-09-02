@@ -58,7 +58,7 @@ CREATE INDEX IF NOT EXISTS idx_entries_user_date ON entries(user_id, date_local)
 CREATE TABLE IF NOT EXISTS user_weights (
   id SERIAL PRIMARY KEY,
   user_id BIGINT NOT NULL,
-  ts_utc TIMESTAMPTZ NOT NULL DEFAULT NOW() AT TIME ZONE 'UTC',
+  ts_utc TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   weight_kg DOUBLE PRECISION NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_user_weights_user_ts ON user_weights(user_id, ts_utc DESC);
@@ -167,9 +167,9 @@ async def add_entry(user_id: int, date_local: Date, tz_offset: str,
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            INSERT INTO entries (user_id, ts_utc, date_local, tz_offset, item, protein_g, calories_kcal)
-            VALUES ($1, NOW() AT TIME ZONE 'UTC', $2, $3, $4, $5, $6)
-            RETURNING id
+                INSERT INTO entries (user_id, ts_utc, date_local, tz_offset, item, protein_g, calories_kcal)
+                VALUES ($1, NOW(), $2, $3, $4, $5, $6)
+                RETURNING id
             """,
             user_id, date_local, tz_offset, item, protein_g, calories_kcal,
         )
