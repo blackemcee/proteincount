@@ -76,9 +76,17 @@ CREATE INDEX IF NOT EXISTS idx_user_callimits_user_ts ON user_cal_limits(user_id
 DEFAULT_WEIGHT_KG = 80.0        # если пользователь ещё не задавал вес
 PROTEIN_PER_KG = 2.0            # 2 г/кг
 DEFAULT_CAL_LIMIT_KCAL = 2000.0 # базовый дневной лимит калорий
+QUICK_ITEMS = {
+    "Капучино": ("капучино", 4.0, 60.0),
+    "Протеин":  ("протеин", 24.0, 113.0),
+    "Казеин":   ("казеин", 24.0, 116.0),
+}
 
 # Одна большая кнопка
-MAIN_KEYBOARD = ReplyKeyboardMarkup([["/add"]], resize_keyboard=True)
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [["/add", "Капучино"], ["Протеин", "Казеин"]],
+    resize_keyboard=True
+)
 
 @dataclass
 class Entry:
@@ -407,6 +415,31 @@ async def process_add_payload(update: Update, context: ContextTypes.DEFAULT_TYPE
         reply_markup=MAIN_KEYBOARD
     )
 
+async def process_quick_item(update: Update, context: ContextTypes.DEFAULT_TYPE, item: str, protein: float, calories: float):
+    tzinfo = user_tz(update)
+    date_obj = today_local_date(tzinfo)
+    off = tz_offset_str(tzinfo)
+
+    rid = await add_entry(update.effective_user.id, date_obj, off, item, protein, calories)
+
+    total_p, total_c = await totals_for_date(update.effective_user.id, date_obj)
+    weight = await get_weight_for_date(update.effective_user.id, date_obj, tzinfo)
+    goal_p = get_goal_protein_for_user(weight)
+    cal_lim = await get_cal_limit_for_date(update.effective_user.id, date_obj, tzinfo)
+    remain_p = max(goal_p - total_p, 0.0)
+    remain_c = max(cal_lim - total_c, 0.0)
+
+    # если мы были в режиме ожидания /add — сбросим
+    context.user_data.pop("awaiting_add", None)
+
+    await update.message.reply_text(
+        f"Добавлено: {item} — {fmt_amount(protein, 'г белка')}, {fmt_amount(calories, 'ккал')} (#{rid})\n"
+        f"Итого за {date_obj.isoformat()}: {fmt_amount(total_p, 'г белка')}, {fmt_amount(total_c, 'ккал')}\n"
+        f"Цель по белку: {fmt_amount(goal_p, 'г')}, осталось: {fmt_amount(remain_p, 'г')}\n"
+        f"Лимит по калориям: {fmt_amount(cal_lim, 'ккал')}, осталось: {fmt_amount(remain_c, 'ккал')}",
+        reply_markup=MAIN_KEYBOARD
+    )
+
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
     args = text.split(maxsplit=1)
@@ -420,15 +453,28 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text or ""
+    text = (update.message.text or "").strip()
+
+    # ➊ Быстрые кнопки
+    if text in QUICK_ITEMS:
+        item, p, c = QUICK_ITEMS[text]
+        await process_quick_item(update, context, item, p, c)
+        return
+
+    # ➋ Если ждём продолжение после /add — обрабатываем
     if context.user_data.get("awaiting_add"):
         await process_add_payload(update, context, text)
         return
+
+    # ➌ Свободный текст: попробуем распарсить и добавить
     parsed = parse_freeform(text)
     if parsed:
         await process_add_payload(update, context, text)
     else:
-        await update.message.reply_text("Нажми Add или /help.", reply_markup=MAIN_KEYBOARD)
+        await update.message.reply_text(
+            "Сообщение не распознано. Нажми Add или одну из быстрых кнопок.",
+            reply_markup=MAIN_KEYBOARD
+        )
 
 # --- Итоги/резюме ---
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
