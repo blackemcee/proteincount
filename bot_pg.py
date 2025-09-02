@@ -4,12 +4,13 @@ Protein & Calories Tracker Bot — PostgreSQL (Railway)
 ----------------------------------------------------
 Зависимости: python-telegram-bot==21.4, asyncpg==0.29.0, python-dateutil, certifi
 
-ENV:
-  TELEGRAM_TOKEN=...                        # токен бота
-  DATABASE_URL=...                          # возьми из DATABASE_PUBLIC_URL Postgres + ?sslmode=require
-  # или DATABASE_PUBLIC_URL=...
-  USER_TZ=Europe/Amsterdam                  # опционально
-  ALLOW_SELF_SIGNED=1                       # опционально: аварийный режим SSL (НЕбезопасно, только на время)
+ENV (Railway → Variables):
+  TELEGRAM_TOKEN=...                        # токен бота из BotFather
+  DATABASE_URL=...                          # возьми PUBLIC URL из Postgres (обычно DATABASE_PUBLIC_URL)
+                                            # и добавь '?sslmode=require' если его нет
+  # или вместо DATABASE_URL можно задать DATABASE_PUBLIC_URL (код сам подхватит)
+  USER_TZ=Europe/Amsterdam                  # (опционально)
+  ALLOW_SELF_SIGNED=1                       # (опционально, временно) отключить проверку TLS-цепочки
 """
 
 from __future__ import annotations
@@ -22,7 +23,6 @@ import os
 import re
 import ssl
 import sys
-import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Tuple
@@ -75,6 +75,7 @@ class Entry:
 # ===================== DB POOL =====================
 
 def _mask_dsn(dsn: str) -> str:
+    """Скрыть пароль в DSN для логов."""
     try:
         u = urlparse(dsn)
         netloc = u.netloc
@@ -212,12 +213,15 @@ async def totals_for_date(user_id: int, date_local: str) -> Tuple[float, float]:
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT COALESCE(SUM(protein_g),0), COALESCE(SUM(calories_kcal),0)
-            FROM entries WHERE user_id=$1 AND date_local=$2::date
+            SELECT
+              COALESCE(SUM(protein_g), 0) AS sum_protein,
+              COALESCE(SUM(calories_kcal), 0) AS sum_cal
+            FROM entries
+            WHERE user_id=$1 AND date_local=$2::date
             """,
             user_id, date_local,
         )
-        return float(row["coalesce"]), float(row["coalesce_1"])
+        return float(row["sum_protein"]), float(row["sum_cal"])
 
 
 # ===================== HELPERS =====================
@@ -406,13 +410,17 @@ async def do_export(update: Update, context: ContextTypes.DEFAULT_TYPE, date_str
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.error("Handler error: %r", context.error)
 
-async def main():
+async def init_db_once():
+    await get_pool()
+
+def main():
     if not TOKEN:
         raise SystemExit("TELEGRAM_TOKEN env var is required")
     if not DATABASE_URL:
         raise SystemExit("DATABASE_URL (или DATABASE_PUBLIC_URL) env var is required")
 
-    await get_pool()
+    # Разовая инициализация БД (асинхронно)
+    asyncio.run(init_db_once())
 
     app = Application.builder().token(TOKEN).build()
 
@@ -429,11 +437,8 @@ async def main():
     app.add_error_handler(on_error)
 
     log.info("Bot starting (PostgreSQL)…")
-    await app.run_polling(close_loop=False)
+    # ВАЖНО: не await — метод блокирующий, сам крутит цикл
+    app.run_polling()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except Exception:
-        print("FATAL:", traceback.format_exc())
-        raise
+    main()
