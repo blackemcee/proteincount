@@ -237,6 +237,16 @@ def parse_freeform(text: str) -> Optional[Tuple[str, float, float]]:
                 return item, protein, calories
             except ValueError:
                 pass
+
+    # ⚠️ Формат C (подняли выше): "/add омлет 45 400" или "стейк 60 450"
+    m = re.search(r"^\s*/?(?:add\s+)?(.+?)\s+(-?\d+[\.,]?\d*)\s+(-?\d+[\.,]?\d*)\s*$",
+                  text.strip(), flags=re.I)
+    if m:
+        item = m.group(1).strip()
+        protein = clean_number(m.group(2))
+        calories = clean_number(m.group(3))
+        return item, protein, calories
+
     # Формат B: свободный текст "йогурт 20г белка 120 ккал"
     prot_match = re.search(PROTEIN_RE, text, flags=re.I)
     cal_match = re.search(CALORIES_RE, text, flags=re.I)
@@ -247,13 +257,7 @@ def parse_freeform(text: str) -> Optional[Tuple[str, float, float]]:
         tmp = re.sub(CALORIES_RE, "", tmp, flags=re.I)
         item = re.sub(r"\s+", " ", tmp).strip(" -:.,\n") or "без названия"
         return item, protein, calories
-    # Формат C: "стейк 60 450"
-    m = re.search(r"^/?(?:add\s+)?(.+?)\s+(-?\d+[\.,]?\d*)\s+(-?\d+[\.,]?\d*)$", text.strip(), flags=re.I)
-    if m:
-        item = m.group(1).strip()
-        protein = clean_number(m.group(2))
-        calories = clean_number(m.group(3))
-        return item, protein, calories
+
     return None
 
 def fmt_amount(x: float, unit: str) -> str:
@@ -305,16 +309,31 @@ async def handle_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Не понял формат. Примеры:\n"
             "/add омлет; 24; 300\n"
+            "или: \"/add омлет 24 300\"\n"
             "или: \"творог 28 белка 160 ккал\""
         )
         return
+
     item, protein, calories = parsed
     tzinfo = user_tz(update)
     date_obj = today_local_date(tzinfo)
     off = tz_offset_str(tzinfo)
+
     rid = await add_entry(update.effective_user.id, date_obj, off, item, protein, calories)
+    # Считаем итог за день сразу после добавления
+    total_p, total_c = await totals_for_date(update.effective_user.id, date_obj)
+
     await update.message.reply_text(
-        f"Добавлено: {item} — {fmt_amount(protein, 'г белка')}, {fmt_amount(calories, 'ккал')} (#{rid})"
+        "Добавлено: {item} — {p}, {c} (#{rid})\n"
+        "Итого за {date}: {tp}, {tc}".format(
+            item=item,
+            p=fmt_amount(protein, "г белка"),
+            c=fmt_amount(calories, "ккал"),
+            rid=rid,
+            date=date_obj.isoformat(),
+            tp=fmt_amount(total_p, "г белка"),
+            tc=fmt_amount(total_c, "ккал"),
+        )
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
