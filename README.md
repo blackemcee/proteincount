@@ -7,4 +7,4 @@ python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
 pip install -r requirements.txt
 export TELEGRAM_TOKEN=123:ABC  # Windows: set TELEGRAM_TOKEN=...
-python bot.py
+python bot_pg.py
