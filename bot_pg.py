@@ -1,35 +1,35 @@
 #!/usr/bin/env python3
 """
-Protein & Calories Tracker Bot — PostgreSQL edition for Railway
----------------------------------------------------------------
-Бот переписан на PostgreSQL через asyncpg + пул подключений.
+Protein & Calories Tracker Bot — PostgreSQL (Railway)
+----------------------------------------------------
+Зависимости: python-telegram-bot==21.4, asyncpg==0.29.0, python-dateutil, certifi
 
-Установка: pip install -r requirements.txt
-Переменные окружения:
-  TELEGRAM_TOKEN=123:ABC
-  DATABASE_URL=postgresql://user:pass@host:port/dbname  (Railway задаст автоматически)
-  USER_TZ=Europe/Amsterdam  (опционально)
-
-Запуск локально:
-  TELEGRAM_TOKEN=... DATABASE_URL=... python bot_pg.py
-
-Команды: /add, /today, /sum, /undo, /export, + свободный парсинг текстом
+ENV:
+  TELEGRAM_TOKEN=...                        # токен бота
+  DATABASE_URL=...                          # возьми из DATABASE_PUBLIC_URL Postgres + ?sslmode=require
+  # или DATABASE_PUBLIC_URL=...
+  USER_TZ=Europe/Amsterdam                  # опционально
+  ALLOW_SELF_SIGNED=1                       # опционально: аварийный режим SSL (НЕбезопасно, только на время)
 """
+
 from __future__ import annotations
 
 import asyncio
 import csv
 import io
+import logging
 import os
-import ssl
 import re
+import ssl
+import sys
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Tuple
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 import asyncpg
 import certifi
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 from dateutil import tz
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 from telegram.ext import (
@@ -37,8 +37,12 @@ from telegram.ext import (
     ContextTypes, filters
 )
 
+# ---- базовые логи в stdout ----
+logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+log = logging.getLogger("bot")
+
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
-DATABASE_URL = os.environ.get("DATABASE_URL")
+DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("DATABASE_PUBLIC_URL")
 
 POOL: asyncpg.Pool | None = None
 
@@ -67,15 +71,18 @@ class Entry:
     protein_g: float
     calories_kcal: float
 
-# ------------------------ DB helpers -------------------------
+
+# ===================== DB POOL =====================
+
 def _mask_dsn(dsn: str) -> str:
     try:
         u = urlparse(dsn)
         netloc = u.netloc
-        if "@" in netloc and ":" in netloc.split("@")[0]:
-            user, rest = netloc.split("@", 1)
-            user = user.split(":")[0] + ":***"
-            netloc = user + "@" + rest
+        if "@" in netloc:
+            creds, host = netloc.split("@", 1)
+            if ":" in creds:
+                user = creds.split(":", 1)[0]
+                netloc = f"{user}:***@{host}"
         return urlunparse((u.scheme, netloc, u.path, u.params, u.query, u.fragment))
     except Exception:
         return "<hidden>"
@@ -87,61 +94,69 @@ def _ensure_sslmode_require(dsn: str) -> str:
     return urlunparse((u.scheme, u.netloc, u.path, u.params, urlencode(q), u.fragment))
 
 async def get_pool() -> asyncpg.Pool:
+    """
+    Создаёт (один раз) пул соединений с PostgreSQL.
+    - Берём DSN из DATABASE_URL (или DATABASE_PUBLIC_URL).
+    - Если не *.railway.internal → публичный хост: включаем строгий SSL (certifi) и sslmode=require.
+    - Если *.railway.internal → внутренний хост: без SSL (нужна Private Networking).
+    - Если строгий SSL падает и ALLOW_SELF_SIGNED=1 → пробуем RELAXED SSL (временно, небезопасно).
+    """
     global POOL
     if POOL is not None:
         return POOL
 
-    dsn = os.environ.get("DATABASE_URL") or os.environ.get("DATABASE_PUBLIC_URL")
-    if not dsn:
+    if not DATABASE_URL:
         raise SystemExit("DATABASE_URL (или DATABASE_PUBLIC_URL) must be set")
 
+    dsn = DATABASE_URL.strip()
     is_internal = ".railway.internal" in dsn
     use_ssl = not is_internal
 
+    # Публичный хост — добавим sslmode=require, если забыли
     if use_ssl:
         dsn = _ensure_sslmode_require(dsn)
 
-    # Строгий SSL-контекст (публичный хост)
+    # Строгий SSL для публичного хоста
     strict_ssl = None
     if use_ssl:
         strict_ssl = ssl.create_default_context(cafile=certifi.where())
         strict_ssl.check_hostname = True
         strict_ssl.verify_mode = ssl.CERT_REQUIRED
 
-    print("[DB] DSN:", _mask_dsn(dsn))
-    print("[DB] Host type:", "external (SSL strict)" if use_ssl else "internal (no SSL)")
+    log.info("[DB] DSN: %s", _mask_dsn(dsn))
+    log.info("[DB] Host type: %s", "external (SSL strict)" if use_ssl else "internal (no SSL)")
 
     try:
         POOL = await asyncpg.create_pool(dsn, min_size=1, max_size=4, ssl=strict_ssl)
     except Exception as e:
         msg = repr(e)
-        print("[DB] Strict SSL connection failed:", msg)
+        log.error("[DB] Strict connection failed: %s", msg)
 
-        # Если ошибка — и явно разрешён аварийный режим, попробуем ослабленный SSL
         allow_relax = os.environ.get("ALLOW_SELF_SIGNED") == "1"
         if use_ssl and allow_relax and "CERTIFICATE_VERIFY_FAILED" in msg:
-            print("[DB] Retrying with RELAXED SSL (NOT secure, temporary)…")
+            log.warning("[DB] Retrying with RELAXED SSL (NOT secure, temporary)…")
             relaxed_ssl = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             relaxed_ssl.check_hostname = False
             relaxed_ssl.verify_mode = ssl.CERT_NONE
             POOL = await asyncpg.create_pool(dsn, min_size=1, max_size=4, ssl=relaxed_ssl)
         else:
-            # Если внутренний хост падает — подскажем причину
             if is_internal:
-                print("[DB] Hint: internal URL работает только при Private Networking и в одном проекте/окружении/регионе.")
-            # Если публичный — подсказки по URL и sslmode
+                log.error("[DB] Hint: internal URL требует один проект/окружение/регион и Private Networking.")
             if use_ssl:
-                print("[DB] Hint: используй PUBLIC URL вида *.railway.app и убедись, что есть '?sslmode=require'.")
+                log.error("[DB] Hint: используй PUBLIC URL (*.railway.app) с '?sslmode=require'.")
             raise
 
-    # Инициализация схемы
     async with POOL.acquire() as conn:
         await conn.execute(CREATE_SQL)
 
-    print("[DB] Pool ready.")
+    log.info("[DB] Pool ready.")
     return POOL
 
-async def add_entry(user_id: int, date_local: str, tz_offset: str, item: str, protein_g: float, calories_kcal: float) -> int:
+
+# ===================== DB QUERIES =====================
+
+async def add_entry(user_id: int, date_local: str, tz_offset: str,
+                    item: str, protein_g: float, calories_kcal: float) -> int:
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -152,7 +167,7 @@ async def add_entry(user_id: int, date_local: str, tz_offset: str, item: str, pr
             """,
             user_id, date_local, tz_offset, item, protein_g, calories_kcal,
         )
-        return int(row[0])
+        return int(row["id"])
 
 async def get_entries(user_id: int, date_local: str) -> List[Entry]:
     pool = await get_pool()
@@ -164,13 +179,13 @@ async def get_entries(user_id: int, date_local: str) -> List[Entry]:
             """,
             user_id, date_local,
         )
-        res: List[Entry] = []
-        for r in rows:
-            res.append(Entry(
-                id=r[0], user_id=r[1], ts_utc=r[2], date_local=r[3], tz_offset=r[4],
-                item=r[5], protein_g=float(r[6]), calories_kcal=float(r[7])
-            ))
-        return res
+        return [
+            Entry(
+                id=r["id"], user_id=r["user_id"], ts_utc=r["ts_utc"], date_local=r["date_local"],
+                tz_offset=r["tz_offset"], item=r["item"],
+                protein_g=float(r["protein_g"]), calories_kcal=float(r["calories_kcal"])
+            ) for r in rows
+        ]
 
 async def delete_last_today(user_id: int, date_local: str) -> Optional[Entry]:
     pool = await get_pool()
@@ -179,15 +194,17 @@ async def delete_last_today(user_id: int, date_local: str) -> Optional[Entry]:
             """
             DELETE FROM entries WHERE id IN (
               SELECT id FROM entries WHERE user_id=$1 AND date_local=$2::date ORDER BY id DESC LIMIT 1
-            ) RETURNING id, user_id, ts_utc, date_local, tz_offset, item, protein_g, calories_kcal
+            )
+            RETURNING id, user_id, ts_utc, date_local, tz_offset, item, protein_g, calories_kcal
             """,
             user_id, date_local,
         )
         if not row:
             return None
         return Entry(
-            id=row[0], user_id=row[1], ts_utc=row[2], date_local=row[3], tz_offset=row[4],
-            item=row[5], protein_g=float(row[6]), calories_kcal=float(row[7])
+            id=row["id"], user_id=row["user_id"], ts_utc=row["ts_utc"], date_local=row["date_local"],
+            tz_offset=row["tz_offset"], item=row["item"],
+            protein_g=float(row["protein_g"]), calories_kcal=float(row["calories_kcal"])
         )
 
 async def totals_for_date(user_id: int, date_local: str) -> Tuple[float, float]:
@@ -200,16 +217,19 @@ async def totals_for_date(user_id: int, date_local: str) -> Tuple[float, float]:
             """,
             user_id, date_local,
         )
-        return float(row[0] or 0), float(row[1] or 0)
+        return float(row["coalesce"]), float(row["coalesce_1"])
 
-# ----------------------- utilities ---------------------------
-PROTEIN_RE = r"(?:(?:белка?|протеин|protein|prot)\\s*[:=]?\\s*|\\b)(-?\\d+[\\.,]?\\d*)\\s*(?:г|g|гр|grams?)?\\b"
-CALORIES_RE = r"(?:(?:ккал|кило?кал|calories?|k?kcals?|k?cal)\\s*[:=]?\\s*|\\b)(-?\\d+[\\.,]?\\d*)\\b"
+
+# ===================== HELPERS =====================
+
+PROTEIN_RE = r"(?:(?:белка?|протеин|protein|prot)\s*[:=]?\s*|\b)(-?\d+[\.,]?\d*)\s*(?:г|g|гр|grams?)?\b"
+CALORIES_RE = r"(?:(?:ккал|кило?кал|calories?|k?kcals?|k?cal)\s*[:=]?\s*|\b)(-?\d+[\.,]?\d*)\b"
 
 def clean_number(s: str) -> float:
     return float(str(s).replace(",", "."))
 
 def parse_freeform(text: str) -> Optional[Tuple[str, float, float]]:
+    # Формат A: "название; белок; ккал"
     if ";" in text:
         parts = [p.strip() for p in text.split(";")]
         if len(parts) >= 3:
@@ -220,6 +240,7 @@ def parse_freeform(text: str) -> Optional[Tuple[str, float, float]]:
                 return item, protein, calories
             except ValueError:
                 pass
+    # Формат B: свободный текст "йогурт 20г белка 120 ккал"
     prot_match = re.search(PROTEIN_RE, text, flags=re.I)
     cal_match = re.search(CALORIES_RE, text, flags=re.I)
     if prot_match and cal_match:
@@ -227,9 +248,10 @@ def parse_freeform(text: str) -> Optional[Tuple[str, float, float]]:
         calories = clean_number(cal_match.group(1))
         tmp = re.sub(PROTEIN_RE, "", text, flags=re.I)
         tmp = re.sub(CALORIES_RE, "", tmp, flags=re.I)
-        item = re.sub(r"\\s+", " ", tmp).strip(" -:,.\\n") or "без названия"
+        item = re.sub(r"\s+", " ", tmp).strip(" -:.,\n") or "без названия"
         return item, protein, calories
-    m = re.search(r"^/?(?:add\\s+)?(.+?)\\s+(-?\\d+[\\.,]?\\d*)\\s+(-?\\d+[\\.,]?\\d*)$", text.strip(), flags=re.I)
+    # Формат C: "стейк 60 450"
+    m = re.search(r"^/?(?:add\s+)?(.+?)\s+(-?\d+[\.,]?\d*)\s+(-?\d+[\.,]?\d*)$", text.strip(), flags=re.I)
     if m:
         item = m.group(1).strip()
         protein = clean_number(m.group(2))
@@ -262,12 +284,15 @@ def tz_offset_str(tzinfo) -> str:
     m, _ = divmod(r, 60)
     return f"{sign}{h:02d}:{m:02d}"
 
+
+# ===================== HANDLERS =====================
+
 WELCOME = (
-    "Привет! Я считаю белок и калории (PostgreSQL).\\n\\n"
-    "Добавляй записи так:\\n"
-    "1) /add куриная грудка; 45; 220\\n"
-    "2) Просто сообщением: \\\"йогурт 20г белка 120 ккал\\\"\\n"
-    "3) \\\"стейк 60 450\\\" (белок г, ккал)\\n\\n"
+    "Привет! Я считаю белок и калории (PostgreSQL).\n\n"
+    "Добавляй записи так:\n"
+    "1) /add куриная грудка; 45; 220\n"
+    "2) Просто сообщением: \"йогурт 20г белка 120 ккал\"\n"
+    "3) \"стейк 60 450\" (белок г, ккал)\n\n"
     "Команды: /today, /sum [YYYY-MM-DD], /undo, /export [YYYY-MM-DD], /help"
 )
 
@@ -283,9 +308,9 @@ async def handle_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parsed = parse_freeform(payload)
     if not parsed:
         await update.message.reply_text(
-            "Не понял формат. Примеры: \\n"
-            "/add омлет; 24; 300\\n"
-            "или: \\\"творог 28 белка 160 ккал\\\""
+            "Не понял формат. Примеры:\n"
+            "/add омлет; 24; 300\n"
+            "или: \"творог 28 белка 160 ккал\""
         )
         return
     item, protein, calories = parsed
@@ -318,17 +343,17 @@ async def send_summary(update: Update, context: ContextTypes.DEFAULT_TYPE, date_
     uid = update.effective_user.id
     p, c = await totals_for_date(uid, date_str)
     entries = await get_entries(uid, date_str)
-    header = f"Итого за {date_str}: {fmt_amount(p, 'г белка')}, {fmt_amount(c, 'ккал')}\\n"
+    header = f"Итого за {date_str}: {fmt_amount(p, 'г белка')}, {fmt_amount(c, 'ккал')}\n"
     if not entries:
-        await update.message.reply_text(header + "\\nЗаписей нет. Добавь что-нибудь через /add.")
+        await update.message.reply_text(header + "\nЗаписей нет. Добавь что-нибудь через /add.")
         return
-    lines = [header, "\\nЗаписи:"]
+    lines = [header, "\nЗаписи:"]
     for e in entries:
         lines.append(
             f"• {e.item} — {fmt_amount(e.protein_g, 'г')}, {fmt_amount(e.calories_kcal, 'ккал')} (#{e.id})"
         )
     kb = InlineKeyboardMarkup([[InlineKeyboardButton(text="Экспорт CSV", callback_data=f"export:{date_str}")]])
-    await update.message.reply_text("\\n".join(lines), reply_markup=kb)
+    await update.message.reply_text("\n".join(lines), reply_markup=kb)
 
 async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tzinfo = user_tz(update)
@@ -375,12 +400,20 @@ async def do_export(update: Update, context: ContextTypes.DEFAULT_TYPE, date_str
         caption=f"Экспорт за {date_str}"
     )
 
+
+# ===================== MAIN =====================
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.error("Handler error: %r", context.error)
+
 async def main():
     if not TOKEN:
         raise SystemExit("TELEGRAM_TOKEN env var is required")
     if not DATABASE_URL:
-        raise SystemExit("DATABASE_URL env var is required")
+        raise SystemExit("DATABASE_URL (или DATABASE_PUBLIC_URL) env var is required")
+
     await get_pool()
+
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
@@ -393,11 +426,14 @@ async def main():
     app.add_handler(CallbackQueryHandler(on_export_cb, pattern=r"^export:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Bot started (PostgreSQL)… Press Ctrl+C to stop.")
+    app.add_error_handler(on_error)
+
+    log.info("Bot starting (PostgreSQL)…")
     await app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    except Exception:
+        print("FATAL:", traceback.format_exc())
+        raise
