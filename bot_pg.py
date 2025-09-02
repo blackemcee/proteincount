@@ -27,7 +27,7 @@ from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 import asyncpg
 import certifi
 from dateutil import tz
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile, ReplyKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters
@@ -66,6 +66,12 @@ CREATE INDEX IF NOT EXISTS idx_user_weights_user_ts ON user_weights(user_id, ts_
 
 DEFAULT_WEIGHT_KG = 80.0   # если пользователь ни разу не задавал вес
 PROTEIN_PER_KG = 2.0       # 2 г белка на кг
+
+# Одна большая кнопка под полем ввода
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [["/add"]],
+    resize_keyboard=True
+)
 
 @dataclass
 class Entry:
@@ -153,7 +159,6 @@ async def get_pool() -> asyncpg.Pool:
             raise
 
     async with POOL.acquire() as conn:
-        # Убедимся, что ts_utc заполняется текущим временем
         await conn.execute("SET TIME ZONE 'UTC'")
         await conn.execute(CREATE_SQL)
 
@@ -365,14 +370,14 @@ def get_goal_protein_for_user(weight_kg: Optional[float]) -> float:
     return w * PROTEIN_PER_KG
 
 
-# ===================== HANDLERS =====================
+# ===================== HANDЛERS =====================
 
 WELCOME = (
     "Привет! Я считаю белок и калории (PostgreSQL).\n\n"
     "Добавляй записи так:\n"
-    "1) /add куриная грудка; 45; 220\n"
-    "2) \"/add омлет 45 400\"\n"
-    "3) просто текст: \"йогурт 20г белка 120 ккал\"\n\n"
+    "• /add омлет 45 400\n"
+    "• или: омлет; 45; 400\n"
+    "• или: йогурт 20г белка 120 ккал\n\n"
     "Вес и цель по белку:\n"
     "• /weight 82 — установить вес (цель = 2 г/кг)\n"
     "• Цель в прошлых днях считается по весу на конец того дня (если не было веса — 80 кг)\n\n"
@@ -380,20 +385,21 @@ WELCOME = (
 )
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(WELCOME)
+    await update.message.reply_text(WELCOME, reply_markup=MAIN_KEYBOARD)
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(WELCOME)
+    await update.message.reply_text(WELCOME, reply_markup=MAIN_KEYBOARD)
 
-async def handle_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text if update.message else ""
+# --- Пошаговый /add ---
+async def process_add_payload(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     parsed = parse_freeform(text)
     if not parsed:
         await update.message.reply_text(
             "Не понял формат. Примеры:\n"
-            "/add омлет; 24; 300\n"
-            "/add омлет 24 300\n"
-            "или: \"творог 28 белка 160 ккал\""
+            "• омлет 24 300\n"
+            "• омлет; 24; 300\n"
+            "• йогурт 20г белка 120 ккал",
+            reply_markup=MAIN_KEYBOARD
         )
         return
 
@@ -403,36 +409,56 @@ async def handle_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     off = tz_offset_str(tzinfo)
 
     rid = await add_entry(update.effective_user.id, date_obj, off, item, protein, calories)
-    # Сразу показываем итоги за день + цель на дату (по весу на конец сегодняшнего дня)
     total_p, total_c = await totals_for_date(update.effective_user.id, date_obj)
     weight = await get_weight_for_date(update.effective_user.id, date_obj, tzinfo)
     goal = get_goal_protein_for_user(weight)
     remain = max(goal - total_p, 0.0)
 
+    context.user_data.pop("awaiting_add", None)
+
     await update.message.reply_text(
-        "Добавлено: {item} — {p}, {c} (#{rid})\n"
-        "Итого за {date}: {tp}, {tc}\n"
-        "Цель по белку (2 г/кг): {goal}\n"
-        "Осталось: {remain}".format(
-            item=item,
-            p=fmt_amount(protein, "г белка"),
-            c=fmt_amount(calories, "ккал"),
-            rid=rid,
-            date=date_obj.isoformat(),
-            tp=fmt_amount(total_p, "г белка"),
-            tc=fmt_amount(total_c, "ккал"),
-            goal=fmt_amount(goal, "г"),
-            remain=fmt_amount(remain, "г"),
-        )
+        f"Добавлено: {item} — {fmt_amount(protein, 'г белка')}, {fmt_amount(calories, 'ккал')} (#{rid})\n"
+        f"Итого за {date_obj.isoformat()}: {fmt_amount(total_p, 'г белка')}, {fmt_amount(total_c, 'ккал')}\n"
+        f"Цель (2 г/кг): {fmt_amount(goal, 'г')}, осталось: {fmt_amount(remain, 'г')}",
+        reply_markup=MAIN_KEYBOARD
+    )
+
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text or ""
+    args = text.split(maxsplit=1)
+    if len(args) > 1:
+        # /add с аргументами → сразу добавляем
+        payload = args[1]
+        await process_add_payload(update, context, payload)
+        return
+
+    # /add без аргументов → включаем режим ожидания
+    context.user_data["awaiting_add"] = True
+    await update.message.reply_text(
+        "Окей, что добавить? Напиши в одном сообщении:\n"
+        "• омлет 24 300\n"
+        "• или: омлет; 24; 300\n"
+        "• или: йогурт 20г белка 120 ккал",
+        reply_markup=MAIN_KEYBOARD
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    parsed = parse_freeform(update.message.text)
-    if not parsed:
-        await update.message.reply_text("Сообщение не распознано. Используй /help для примеров.")
-        return
-    await handle_add(update, context)
+    text = update.message.text or ""
 
+    if context.user_data.get("awaiting_add"):
+        await process_add_payload(update, context, text)
+        return
+
+    parsed = parse_freeform(text)
+    if parsed:
+        await process_add_payload(update, context, text)
+    else:
+        await update.message.reply_text(
+            "Сообщение не распознано. Нажми Add или /help.",
+            reply_markup=MAIN_KEYBOARD
+        )
+
+# --- Остальные команды ---
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tzinfo = user_tz(update)
     date_obj = today_local_date(tzinfo)
@@ -460,7 +486,7 @@ async def send_summary(update: Update, context: ContextTypes.DEFAULT_TYPE, date_
         f"Осталось: {fmt_amount(remain, 'г')}\n"
     )
     if not entries:
-        await update.message.reply_text(header + "\nЗаписей нет. Добавь что-нибудь через /add.")
+        await update.message.reply_text(header + "\nЗаписей нет. Нажми Add, чтобы добавить.", reply_markup=MAIN_KEYBOARD)
         return
     lines = [header, "Записи:"]
     for e in entries:
@@ -473,7 +499,7 @@ async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     date_obj = today_local_date(tzinfo)
     entry = await delete_last_today(update.effective_user.id, date_obj)
     if not entry:
-        await update.message.reply_text("За сегодня записей нет — удалять нечего.")
+        await update.message.reply_text("За сегодня записей нет — удалять нечего.", reply_markup=MAIN_KEYBOARD)
         return
     p, c = await totals_for_date(update.effective_user.id, date_obj)
     weight = await get_weight_for_date(update.effective_user.id, date_obj, tzinfo)
@@ -483,8 +509,7 @@ async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Удалено: {item} — {p1}, {c1} (#{id})\n"
         "Итого за {date}: {p2}, {c2}\n"
-        "Цель по белку: {goal}\n"
-        "Осталось: {remain}".format(
+        "Цель: {goal}, осталось: {remain}".format(
             item=entry.item,
             p1=fmt_amount(entry.protein_g, "г"),
             c1=fmt_amount(entry.calories_kcal, "ккал"),
@@ -494,23 +519,24 @@ async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             c2=fmt_amount(c, "ккал"),
             goal=fmt_amount(goal, "г"),
             remain=fmt_amount(remain, "г"),
-        )
+        ),
+        reply_markup=MAIN_KEYBOARD
     )
 
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Укажи id записи: /delete 12")
+        await update.message.reply_text("Укажи id записи: /delete 12", reply_markup=MAIN_KEYBOARD)
         return
     try:
         entry_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("id должен быть числом: /delete 12")
+        await update.message.reply_text("id должен быть числом: /delete 12", reply_markup=MAIN_KEYBOARD)
         return
 
     uid = update.effective_user.id
     deleted = await delete_by_id(uid, entry_id)
     if not deleted:
-        await update.message.reply_text("Запись не найдена или не твоя.")
+        await update.message.reply_text("Запись не найдена или не твоя.", reply_markup=MAIN_KEYBOARD)
         return
 
     tzinfo = user_tz(update)
@@ -522,8 +548,7 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Удалено: {item} — {p1}, {c1} (#{id})\n"
         "Итого за {date}: {p2}, {c2}\n"
-        "Цель по белку: {goal}\n"
-        "Осталось: {remain}".format(
+        "Цель: {goal}, осталось: {remain}".format(
             item=deleted.item,
             p1=fmt_amount(deleted.protein_g, "г"),
             c1=fmt_amount(deleted.calories_kcal, "ккал"),
@@ -533,7 +558,8 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
             c2=fmt_amount(c, "ккал"),
             goal=fmt_amount(goal, "г"),
             remain=fmt_amount(remain, "г"),
-        )
+        ),
+        reply_markup=MAIN_KEYBOARD
     )
 
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -558,7 +584,7 @@ async def do_export(update: Update, context: ContextTypes.DEFAULT_TYPE, date_obj
     entries = await get_entries(uid, date_obj)
     if not entries:
         if update.message:
-            await update.message.reply_text("Нет записей для экспорта.")
+            await update.message.reply_text("Нет записей для экспорта.", reply_markup=MAIN_KEYBOARD)
         else:
             await update.callback_query.edit_message_text("Нет записей для экспорта.")
         return
@@ -582,7 +608,8 @@ async def cmd_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"Текущий вес: {fmt_amount(current, 'кг')}\n"
             f"Цель по белку: {fmt_amount(get_goal_protein_for_user(current), 'г')} (2 г/кг)\n"
-            f"Чтобы задать новый: /weight 82"
+            f"Чтобы задать новый: /weight 82",
+            reply_markup=MAIN_KEYBOARD
         )
         return
     try:
@@ -590,12 +617,13 @@ async def cmd_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if w <= 0 or w > 500:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("Укажи корректный вес в килограммах, например: /weight 82")
+        await update.message.reply_text("Укажи корректный вес в килограммах, например: /weight 82", reply_markup=MAIN_KEYBOARD)
         return
     await set_weight(update.effective_user.id, w)
     await update.message.reply_text(
         f"Вес обновлён: {fmt_amount(w, 'кг')}. "
-        f"Новая цель по белку: {fmt_amount(get_goal_protein_for_user(w), 'г')} в день."
+        f"Новая цель по белку: {fmt_amount(get_goal_protein_for_user(w), 'г')} в день.",
+        reply_markup=MAIN_KEYBOARD
     )
 
 
@@ -621,7 +649,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("weight", cmd_weight))
-    app.add_handler(CommandHandler("add", handle_add))
+    app.add_handler(CommandHandler("add", cmd_add))  # один хендлер /add
     app.add_handler(CommandHandler(["today"], cmd_today))
     app.add_handler(CommandHandler(["sum"], cmd_sum))
     app.add_handler(CommandHandler(["undo"], cmd_undo))
