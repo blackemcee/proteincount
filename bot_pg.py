@@ -29,6 +29,7 @@ from typing import List, Optional, Tuple
 
 import asyncpg
 import certifi
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 from dateutil import tz
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 from telegram.ext import (
@@ -67,6 +68,24 @@ class Entry:
     calories_kcal: float
 
 # ------------------------ DB helpers -------------------------
+def _mask_dsn(dsn: str) -> str:
+    try:
+        u = urlparse(dsn)
+        netloc = u.netloc
+        if "@" in netloc and ":" in netloc.split("@")[0]:
+            user, rest = netloc.split("@", 1)
+            user = user.split(":")[0] + ":***"
+            netloc = user + "@" + rest
+        return urlunparse((u.scheme, netloc, u.path, u.params, u.query, u.fragment))
+    except Exception:
+        return "<hidden>"
+
+def _ensure_sslmode_require(dsn: str) -> str:
+    u = urlparse(dsn)
+    q = dict(parse_qsl(u.query, keep_blank_values=True))
+    q.setdefault("sslmode", "require")
+    return urlunparse((u.scheme, u.netloc, u.path, u.params, urlencode(q), u.fragment))
+
 async def get_pool() -> asyncpg.Pool:
     global POOL
     if POOL is not None:
@@ -74,20 +93,52 @@ async def get_pool() -> asyncpg.Pool:
 
     dsn = os.environ.get("DATABASE_URL") or os.environ.get("DATABASE_PUBLIC_URL")
     if not dsn:
-        raise SystemExit("DATABASE_URL (или DATABASE_PUBLIC_URL) env var is required")
+        raise SystemExit("DATABASE_URL (или DATABASE_PUBLIC_URL) must be set")
 
-    # Внешний хост -> включаем SSL и проверку цепочки через certifi
-    use_ssl = (".railway.internal" not in dsn)
-    ssl_ctx = None
+    is_internal = ".railway.internal" in dsn
+    use_ssl = not is_internal
+
     if use_ssl:
-        if "sslmode=" not in dsn:
-            dsn += ("&" if "?" in dsn else "?") + "sslmode=require"
-        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+        dsn = _ensure_sslmode_require(dsn)
 
-    POOL = await asyncpg.create_pool(dsn, min_size=1, max_size=4, ssl=ssl_ctx)
+    # Строгий SSL-контекст (публичный хост)
+    strict_ssl = None
+    if use_ssl:
+        strict_ssl = ssl.create_default_context(cafile=certifi.where())
+        strict_ssl.check_hostname = True
+        strict_ssl.verify_mode = ssl.CERT_REQUIRED
 
+    print("[DB] DSN:", _mask_dsn(dsn))
+    print("[DB] Host type:", "external (SSL strict)" if use_ssl else "internal (no SSL)")
+
+    try:
+        POOL = await asyncpg.create_pool(dsn, min_size=1, max_size=4, ssl=strict_ssl)
+    except Exception as e:
+        msg = repr(e)
+        print("[DB] Strict SSL connection failed:", msg)
+
+        # Если ошибка — и явно разрешён аварийный режим, попробуем ослабленный SSL
+        allow_relax = os.environ.get("ALLOW_SELF_SIGNED") == "1"
+        if use_ssl and allow_relax and "CERTIFICATE_VERIFY_FAILED" in msg:
+            print("[DB] Retrying with RELAXED SSL (NOT secure, temporary)…")
+            relaxed_ssl = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            relaxed_ssl.check_hostname = False
+            relaxed_ssl.verify_mode = ssl.CERT_NONE
+            POOL = await asyncpg.create_pool(dsn, min_size=1, max_size=4, ssl=relaxed_ssl)
+        else:
+            # Если внутренний хост падает — подскажем причину
+            if is_internal:
+                print("[DB] Hint: internal URL работает только при Private Networking и в одном проекте/окружении/регионе.")
+            # Если публичный — подсказки по URL и sslmode
+            if use_ssl:
+                print("[DB] Hint: используй PUBLIC URL вида *.railway.app и убедись, что есть '?sslmode=require'.")
+            raise
+
+    # Инициализация схемы
     async with POOL.acquire() as conn:
         await conn.execute(CREATE_SQL)
+
+    print("[DB] Pool ready.")
     return POOL
 
 async def add_entry(user_id: int, date_local: str, tz_offset: str, item: str, protein_g: float, calories_kcal: float) -> int:
