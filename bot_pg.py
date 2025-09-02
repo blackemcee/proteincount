@@ -20,7 +20,7 @@ import re
 import ssl
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta, date as Date
+from datetime import datetime, timezone, timedelta, date as Date, time as Time
 from typing import List, Optional, Tuple
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS entries (
 );
 CREATE INDEX IF NOT EXISTS idx_entries_user_date ON entries(user_id, date_local);
 
--- Храним историю веса; берём последнее значение как актуальное
+-- История веса; берём последнее значение на конец дня
 CREATE TABLE IF NOT EXISTS user_weights (
   id SERIAL PRIMARY KEY,
   user_id BIGINT NOT NULL,
@@ -64,8 +64,8 @@ CREATE TABLE IF NOT EXISTS user_weights (
 CREATE INDEX IF NOT EXISTS idx_user_weights_user_ts ON user_weights(user_id, ts_utc DESC);
 """
 
-DEFAULT_WEIGHT_KG = 80.0  # если пользователь ни разу не задавал вес
-PROTEIN_PER_KG = 2.0      # 2 г белка на кг
+DEFAULT_WEIGHT_KG = 80.0   # если пользователь ни разу не задавал вес
+PROTEIN_PER_KG = 2.0       # 2 г белка на кг
 
 @dataclass
 class Entry:
@@ -153,6 +153,8 @@ async def get_pool() -> asyncpg.Pool:
             raise
 
     async with POOL.acquire() as conn:
+        # Убедимся, что ts_utc заполняется текущим временем
+        await conn.execute("SET TIME ZONE 'UTC'")
         await conn.execute(CREATE_SQL)
 
     log.info("[DB] Pool ready.")
@@ -167,9 +169,9 @@ async def add_entry(user_id: int, date_local: Date, tz_offset: str,
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-                INSERT INTO entries (user_id, ts_utc, date_local, tz_offset, item, protein_g, calories_kcal)
-                VALUES ($1, NOW(), $2, $3, $4, $5, $6)
-                RETURNING id
+            INSERT INTO entries (user_id, ts_utc, date_local, tz_offset, item, protein_g, calories_kcal)
+            VALUES ($1, NOW(), $2, $3, $4, $5, $6)
+            RETURNING id
             """,
             user_id, date_local, tz_offset, item, protein_g, calories_kcal,
         )
@@ -267,6 +269,29 @@ async def get_latest_weight(user_id: int) -> Optional[float]:
             return None
         return float(row["weight_kg"])
 
+async def get_weight_for_date(user_id: int, date_obj: Date, tzinfo) -> float:
+    """
+    Вес на конец указанной даты (локальное время пользователя).
+    Берём запись из user_weights с ts_utc <= конец_дня_UTC, последнюю по времени.
+    Если записей нет — DEFAULT_WEIGHT_KG.
+    """
+    local_eod = datetime.combine(date_obj, Time(23, 59, 59), tzinfo=tzinfo)
+    cutoff_utc = local_eod.astimezone(timezone.utc)
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT weight_kg
+            FROM user_weights
+            WHERE user_id = $1 AND ts_utc <= $2
+            ORDER BY ts_utc DESC
+            LIMIT 1
+            """,
+            user_id, cutoff_utc
+        )
+    return float(row["weight_kg"]) if row else DEFAULT_WEIGHT_KG
+
 
 # ===================== HELPERS =====================
 
@@ -350,7 +375,7 @@ WELCOME = (
     "3) просто текст: \"йогурт 20г белка 120 ккал\"\n\n"
     "Вес и цель по белку:\n"
     "• /weight 82 — установить вес (цель = 2 г/кг)\n"
-    "Если вес не задан, беру 80 кг.\n\n"
+    "• Цель в прошлых днях считается по весу на конец того дня (если не было веса — 80 кг)\n\n"
     "Команды: /today, /sum [YYYY-MM-DD], /undo, /delete <id>, /export [YYYY-MM-DD], /help"
 )
 
@@ -378,16 +403,16 @@ async def handle_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     off = tz_offset_str(tzinfo)
 
     rid = await add_entry(update.effective_user.id, date_obj, off, item, protein, calories)
-    # Сразу показываем итоги за день + цель
+    # Сразу показываем итоги за день + цель на дату (по весу на конец сегодняшнего дня)
     total_p, total_c = await totals_for_date(update.effective_user.id, date_obj)
-    weight = await get_latest_weight(update.effective_user.id)
+    weight = await get_weight_for_date(update.effective_user.id, date_obj, tzinfo)
     goal = get_goal_protein_for_user(weight)
     remain = max(goal - total_p, 0.0)
 
     await update.message.reply_text(
         "Добавлено: {item} — {p}, {c} (#{rid})\n"
         "Итого за {date}: {tp}, {tc}\n"
-        "Цель по белку: {goal}\n"
+        "Цель по белку (2 г/кг): {goal}\n"
         "Осталось: {remain}".format(
             item=item,
             p=fmt_amount(protein, "г белка"),
@@ -420,16 +445,18 @@ async def cmd_sum(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def send_summary(update: Update, context: ContextTypes.DEFAULT_TYPE, date_obj: Date):
     uid = update.effective_user.id
+    tzinfo = user_tz(update)
     p, c = await totals_for_date(uid, date_obj)
     entries = await get_entries(uid, date_obj)
-    weight = await get_latest_weight(uid)
+
+    weight = await get_weight_for_date(uid, date_obj, tzinfo)
     goal = get_goal_protein_for_user(weight)
     remain = max(goal - p, 0.0)
 
     date_str = date_obj.isoformat()
     header = (
         f"Итого за {date_str}: {fmt_amount(p, 'г белка')}, {fmt_amount(c, 'ккал')}\n"
-        f"Цель по белку: {fmt_amount(goal, 'г')} (2 г/кг)\n"
+        f"Цель по белку (2 г/кг): {fmt_amount(goal, 'г')}\n"
         f"Осталось: {fmt_amount(remain, 'г')}\n"
     )
     if not entries:
@@ -448,9 +475,8 @@ async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not entry:
         await update.message.reply_text("За сегодня записей нет — удалять нечего.")
         return
-    # Покажем отмену + новые итоги/цель
     p, c = await totals_for_date(update.effective_user.id, date_obj)
-    weight = await get_latest_weight(update.effective_user.id)
+    weight = await get_weight_for_date(update.effective_user.id, date_obj, tzinfo)
     goal = get_goal_protein_for_user(weight)
     remain = max(goal - p, 0.0)
 
@@ -487,8 +513,9 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Запись не найдена или не твоя.")
         return
 
+    tzinfo = user_tz(update)
     p, c = await totals_for_date(uid, deleted.date_local)
-    weight = await get_latest_weight(uid)
+    weight = await get_weight_for_date(uid, deleted.date_local, tzinfo)
     goal = get_goal_protein_for_user(weight)
     remain = max(goal - p, 0.0)
 
@@ -593,7 +620,7 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("weight", cmd_weight))    # <— НОВОЕ
+    app.add_handler(CommandHandler("weight", cmd_weight))
     app.add_handler(CommandHandler("add", handle_add))
     app.add_handler(CommandHandler(["today"], cmd_today))
     app.add_handler(CommandHandler(["sum"], cmd_sum))
