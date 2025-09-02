@@ -28,6 +28,7 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Tuple
 
 import asyncpg
+import certifi
 from dateutil import tz
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 from telegram.ext import (
@@ -67,17 +68,6 @@ class Entry:
 
 # ------------------------ DB helpers -------------------------
 async def get_pool() -> asyncpg.Pool:
-    """
-    Создаёт (один раз) пул соединений с PostgreSQL.
-    Приоритет переменных:
-      1) DATABASE_URL
-      2) DATABASE_PUBLIC_URL  (если DATABASE_URL не задан)
-
-    Логика SSL:
-      - Если хост внешний (не *.railway.internal) — включаем SSL.
-      - Если внутренний (*.railway.internal) — SSL не используем.
-      - Если в DSN явно задан sslmode, уважаем его (но для asyncpg всё равно лучше передать ssl=ctx).
-    """
     global POOL
     if POOL is not None:
         return POOL
@@ -86,31 +76,18 @@ async def get_pool() -> asyncpg.Pool:
     if not dsn:
         raise SystemExit("DATABASE_URL (или DATABASE_PUBLIC_URL) env var is required")
 
-    # Определяем, внутренний ли хост Railway
-    # Простейшая эвристика: если в строке есть ".railway.internal" — это private network без SSL
+    # Внешний хост -> включаем SSL и проверку цепочки через certifi
     use_ssl = (".railway.internal" not in dsn)
-
     ssl_ctx = None
     if use_ssl:
-        # Готовим SSL-контекст. Для Railway достаточно дефолтного.
-        ssl_ctx = ssl.create_default_context()
-        # На всякий случай добавим sslmode=require, если его нет в строке
         if "sslmode=" not in dsn:
-            sep = "&" if "?" in dsn else "?"
-            dsn = f"{dsn}{sep}sslmode=require"
+            dsn += ("&" if "?" in dsn else "?") + "sslmode=require"
+        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
 
-    # Создаём пул
-    POOL = await asyncpg.create_pool(
-        dsn,
-        min_size=1,
-        max_size=4,
-        ssl=ssl_ctx  # None для внутреннего, контекст для внешнего
-    )
+    POOL = await asyncpg.create_pool(dsn, min_size=1, max_size=4, ssl=ssl_ctx)
 
-    # Инициализация схемы (идемпотентно)
     async with POOL.acquire() as conn:
         await conn.execute(CREATE_SQL)
-
     return POOL
 
 async def add_entry(user_id: int, date_local: str, tz_offset: str, item: str, protein_g: float, calories_kcal: float) -> int:
